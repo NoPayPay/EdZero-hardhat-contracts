@@ -85,7 +85,9 @@ describe("FundsVault", function () {
       // Advance time by 90 days
       await time.increase(90 * 24 * 60 * 60);
 
-      await vault.withdrawPrincipal();
+      // Get the principal token balance to withdraw
+      const [, ptBalance] = await vault.getHoldings(owner.address);
+      await vault.withdrawPrincipal(ptBalance);
 
       const balanceAfterWithdraw = await mockUSDC.balanceOf(owner.address);
       console.log("Balance after withdraw:", ethers.formatUnits(balanceAfterWithdraw, 6));
@@ -100,7 +102,9 @@ describe("FundsVault", function () {
       // Advance time by only 10 days
       await time.increase(10 * 24 * 60 * 60);
 
-      await expect(vault.withdrawPrincipal()).to.be.revertedWith("90-day lockup not completed");
+      // Get the principal token balance to withdraw
+      const [, ptBalance] = await vault.getHoldings(owner.address);
+      await expect(vault.withdrawPrincipal(ptBalance)).to.be.revertedWith("90-day lockup not completed");
     });
   });
 
@@ -111,8 +115,12 @@ describe("FundsVault", function () {
       // Advance time significantly to generate yield
       await time.increase(300 * 24 * 60 * 60); // 300 days
 
-      const yieldAmount = await vault.harvestYield();
-      expect(yieldAmount).to.be.gt(0);
+      const tx = await vault.harvestYield();
+      await tx.wait();
+
+      // Check USDC balance of treasury instead of return value
+      const treasuryBalance = await mockUSDC.balanceOf(await treasury.getAddress());
+      expect(treasuryBalance).to.be.gt(0);
     });
 
     it("should not harvest yield if none is available", async function () {
@@ -130,8 +138,12 @@ describe("FundsVault", function () {
       // Advance time by only 10 days (less than lockup period)
       await time.increase(10 * 24 * 60 * 60);
 
-      const claimedAmount = await vault.claimFunds(owner.address);
-      expect(claimedAmount).to.be.gt(0);
+      const treasuryBalanceBefore = await mockUSDC.balanceOf(await treasury.getAddress());
+      const tx = await vault.claimFunds(owner.address);
+      await tx.wait();
+
+      const treasuryBalanceAfter = await mockUSDC.balanceOf(await treasury.getAddress());
+      expect(treasuryBalanceAfter).to.be.gt(treasuryBalanceBefore);
     });
   });
 
@@ -139,21 +151,35 @@ describe("FundsVault", function () {
     it("should pay merchant", async function () {
       await deposit();
 
-      const merchantBalanceBefore = await mockUSDC.balanceOf(merchant.address);
-      const amountToPay = ethers.parseUnits("50", 6); // 50 USDC
+      // Calculate expected yield token balance (10% of deposit amount)
+      const expectedYieldTokens = (testDepositAmount * 10n) / 100n; // 10 USDC
+      
+      // Make sure we're paying less than our yield token balance
+      const amountToPay = expectedYieldTokens - ethers.parseUnits("1", 6); // Leave some buffer
 
+      // Verify yield token balance
+      const [ytBalance, ] = await vault.getHoldings(owner.address);
+      expect(ytBalance).to.equal(expectedYieldTokens);
+      expect(ytBalance).to.be.gt(amountToPay);
+
+      // Record merchant's balance before payment
+      const merchantBalanceBefore = await mockUSDC.balanceOf(merchant.address);
+
+      // Execute payment
       await vault.payMerchant(amountToPay, merchant.address);
 
+      // Verify merchant received payment
       const merchantBalanceAfter = await mockUSDC.balanceOf(merchant.address);
-      
       expect(merchantBalanceAfter).to.be.gt(merchantBalanceBefore);
       expect(merchantBalanceAfter - merchantBalanceBefore).to.equal(amountToPay);
     });
 
-    it("should not pay merchant more than deposited amount", async function () {
+    it("should not pay merchant more than yield token balance", async function () {
       await deposit();
 
-      const amountToPay = ethers.parseUnits("150", 6); // 150 USDC, more than deposited
+      // Get the yield token balance
+      const [ytBalance, ] = await vault.getHoldings(owner.address);
+      const amountToPay = ytBalance + 1n; // More than YT balance
 
       await expect(vault.payMerchant(amountToPay, merchant.address))
         .to.be.revertedWith("Insufficient funds to cover the payment");
@@ -164,25 +190,39 @@ describe("FundsVault", function () {
     it("should sell yield tokens", async function () {
       await deposit();
 
-      const yieldTokenBalance = await yieldToken.balanceOf(owner.address);
+      const [yieldTokenBalance, ] = await vault.getHoldings(owner.address);
       await vault.sellYieldTokensForTokens(yieldTokenBalance, await mockUSDC.getAddress());
 
-      const yieldTokenBalanceAfter = await yieldToken.balanceOf(owner.address);
+      const [yieldTokenBalanceAfter, ] = await vault.getHoldings(owner.address);
       
       expect(yieldTokenBalanceAfter).to.be.lt(yieldTokenBalance);
       expect(yieldTokenBalanceAfter).to.equal(0);
     });
   });
 
-  describe("Token Decimals", function () {
-    it("should return correct decimal values", async function () {
-      const ytDecimals = await yieldToken.decimals();
-      const ptDecimals = await principalToken.decimals();
-      const usdcDecimals = await mockUSDC.decimals();
+  describe("Lock Period", function () {
+    it("should return correct lock period", async function () {
+      await deposit();
 
-      expect(ytDecimals).to.equal(6);
-      expect(ptDecimals).to.equal(6);
-      expect(usdcDecimals).to.equal(6);
+      const lockPeriod = await vault.getLockPeriod(owner.address);
+      expect(lockPeriod).to.equal(90 * 24 * 60 * 60); // 90 days in seconds
+    });
+  });
+
+  describe("Get Holdings", function () {
+    it("should return correct user holdings", async function () {
+      await deposit();
+
+      const [ytBalance, ptBalance] = await vault.getHoldings(owner.address);
+      expect(ytBalance).to.equal((testDepositAmount * 10n) / 100n); // 10% of deposit
+      expect(ptBalance).to.equal(testDepositAmount); // 100% of deposit
+    });
+  });
+
+  describe("APY Rate", function () {
+    it("should return correct APY rate", async function () {
+      const apy = await vault.getCurrentAPY();
+      expect(apy).to.equal(10); // 10% APY as defined in the contract
     });
   });
 });
